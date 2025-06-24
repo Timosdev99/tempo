@@ -1,11 +1,9 @@
 use clap::{Args, Parser};
-use malachitebft_app::node::Node;
 use reth::builder::NodeHandle;
 use reth_malachite::app::node::RethNode;
 use reth_malachite::app::{Config, Genesis, State, ValidatorInfo};
 use reth_malachite::cli::{Cli, MalachiteChainSpecParser};
-use reth_malachite::consensus::config::EngineConfig;
-use reth_malachite::consensus::node::MalachiteNode;
+use reth_malachite::consensus::{start_consensus_engine, EngineConfig};
 use reth_malachite::context::MalachiteContext;
 use reth_malachite::types::Address;
 use std::path::PathBuf;
@@ -58,24 +56,15 @@ fn main() -> eyre::Result<()> {
                 "127.0.0.1:26657".parse()?,
             );
 
-            // Create the Malachite consensus node
-            let malachite_node = MalachiteNode::new(engine_config, home_dir, state);
-
-            // Start the consensus engine using the run method
-            let consensus_future = tokio::spawn(async move {
-                if let Err(e) = malachite_node.run().await {
-                    tracing::error!("Consensus engine error: {}", e);
-                }
-            });
-
-            tracing::info!("Malachite consensus engine started");
+            // Start the Malachite consensus engine
+            let consensus_handle = start_consensus_engine(state, engine_config, home_dir).await?;
 
             // Wait for the node to exit
             tokio::select! {
                 _ = node_exit_future => {
                     tracing::info!("Reth node exited");
                 }
-                _ = consensus_future => {
+                _ = consensus_handle.app => {
                     tracing::info!("Consensus engine exited");
                 }
                 _ = tokio::signal::ctrl_c() => {
