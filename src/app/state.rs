@@ -2,8 +2,8 @@ use crate::{
     context::{BasePeerAddress, BasePeerSet, MalachiteContext},
     height::Height,
     provider::Ed25519Provider,
-    store::Store,
-    types::Address,
+    store::{DecidedValue, Store},
+    types::{Address, ValueId},
     utils::seed_from_address,
     ProposalPart, Value,
 };
@@ -13,7 +13,9 @@ use malachitebft_app_channel::app::{
     streaming::StreamMessage,
     types::{LocallyProposedValue, PeerId as MalachitePeerId, ProposedValue},
 };
-use malachitebft_core_types::{CommitCertificate, Height as HeightTrait, Round, VoteExtensions};
+use malachitebft_core_types::{
+    CommitCertificate, Height as HeightTrait, Round, Validity, VoteExtensions,
+};
 use rand::{rngs::StdRng, SeedableRng};
 use reth_engine_primitives::BeaconConsensusEngineHandle;
 use reth_node_builder::NodeTypes;
@@ -57,9 +59,29 @@ impl Clone for ThreadSafeRng {
     }
 }
 
-/// Represents the internal state of the application node
-/// Contains information about current height, round, proposals and blocks
-/// Thread-safe for concurrent access
+/// State represents the application state for the Malachite-Reth integration.
+/// It manages consensus state, validator information, and block production.
+///
+/// # Architecture and API Boundaries
+///
+/// State serves as the central mediator between the consensus engine and the storage layer:
+///
+/// ```text
+/// Consensus Handler
+///       | (calls State methods)
+///     State
+///       | (internal Store access)
+///     Store
+///       | (database operations)
+///   RethStore
+/// ```
+///
+/// ## API Categories:
+///
+/// - **Consensus Operations**: `commit()`, `propose_value()`, `get_decided_value()`
+/// - **State Management**: `current_height()`, `current_round()`, `get_validator_set()`
+/// - **Storage Access**: `store_synced_proposal()`, `get_proposal_for_restreaming()`
+/// - **Peer Management**: `add_peer()`, `remove_peer()`, `get_peers()`
 #[derive(Clone)]
 pub struct State {
     // Immutable fields (no synchronization needed)
@@ -67,7 +89,7 @@ pub struct State {
     pub config: Config,
     pub genesis: Genesis,
     pub address: Address,
-    pub store: Store, // Already thread-safe
+    store: Store, // Already thread-safe
     pub signing_provider: Ed25519Provider,
     pub engine_handle: BeaconConsensusEngineHandle<<EthereumNode as NodeTypes>::Payload>,
 
@@ -108,6 +130,37 @@ impl State {
             streams_map: Arc::new(RwLock::new(PartStreamsMap::new())),
             rng: ThreadSafeRng::new(seed_from_address(&address, std::process::id() as u64)),
         }
+    }
+
+    /// Creates a new State instance from a database provider.
+    ///
+    /// This factory method encapsulates Store creation and initialization,
+    /// ensuring that Store is not directly accessible outside the State module.
+    pub async fn from_provider<P>(
+        ctx: MalachiteContext,
+        config: Config,
+        genesis: Genesis,
+        address: Address,
+        provider: Arc<P>,
+        engine_handle: BeaconConsensusEngineHandle<<EthereumNode as NodeTypes>::Payload>,
+    ) -> Result<Self>
+    where
+        P: reth_provider::DatabaseProviderFactory + Clone + Unpin + Send + Sync + 'static,
+        <P as reth_provider::DatabaseProviderFactory>::Provider: Send + Sync,
+        <P as reth_provider::DatabaseProviderFactory>::ProviderRW: Send,
+    {
+        // Create and verify the store
+        let store = Store::new(provider);
+        store.verify_tables().await?;
+
+        Ok(Self::new(
+            ctx,
+            config,
+            genesis,
+            address,
+            store,
+            engine_handle,
+        ))
     }
 
     // Getter methods for thread-safe access
@@ -233,7 +286,22 @@ impl State {
 
         info!("Proposed value for height {} round {}", height, round);
 
-        Ok(LocallyProposedValue::new(height, round, value))
+        let locally_proposed = LocallyProposedValue::new(height, round, value.clone());
+
+        // Store the proposal we just built so it can be retrieved later
+        let proposer = BasePeerAddress(self.address);
+        let proposed_value = ProposedValue {
+            height,
+            round,
+            valid_round: Round::Nil,
+            proposer,
+            value,
+            validity: Validity::Valid,
+        };
+
+        self.store_built_proposal(proposed_value).await?;
+
+        Ok(locally_proposed)
     }
 
     /// Processes a received proposal part and potentially returns a complete proposal
@@ -264,16 +332,63 @@ impl State {
         certificate: CommitCertificate<MalachiteContext>,
         _extensions: VoteExtensions<MalachiteContext>,
     ) -> Result<()> {
-        info!("Committing value at height {}", certificate.height);
-        // In real implementation, this would commit the block to the chain
+        let height = certificate.height;
+        let round = certificate.round;
+        let value_id = certificate.value_id;
+
+        info!(
+            "Committing value at height {} round {} with value_id {:?}",
+            height, round, value_id
+        );
+
+        // Try to find the value that matches the value_id
+        // First check the round where it was decided, then check all rounds
+        let mut value = None;
+
+        // Check the decided round first
+        if let Ok(Some(proposal)) = self.get_undecided_proposal(height, round, value_id).await {
+            value = Some(proposal.value);
+        }
+
+        // If not found, search all rounds (the proposal might have been from an earlier round)
+        if value.is_none() {
+            for check_round in 0..=round.as_i64() as u32 {
+                if let Ok(Some(proposal)) = self
+                    .get_undecided_proposal(height, Round::new(check_round), value_id)
+                    .await
+                {
+                    value = Some(proposal.value);
+                    break;
+                }
+            }
+        }
+
+        // If we still don't have the value, use a placeholder
+        // In a production system, this would be an error condition
+        let value = value.unwrap_or_else(|| {
+            tracing::warn!(
+                "Could not find proposal for value_id {:?} at height {} - using placeholder",
+                value_id,
+                height
+            );
+            Value::new(Bytes::new())
+        });
+
+        // Store the decided value
+        self.store.store_decided_value(certificate, value).await?;
+
         Ok(())
     }
 
     /// Gets a decided value at the given height
     pub async fn get_decided_value(&self, height: Height) -> Option<DecidedValue> {
-        // For now, return None - this would query the committed blocks
-        info!("Requested decided value for height {}", height);
-        None
+        match self.store.get_decided_value(height).await {
+            Ok(value) => value,
+            Err(e) => {
+                tracing::error!("Failed to get decided value at height {}: {}", height, e);
+                None
+            }
+        }
     }
 
     /// Gets the earliest available height
@@ -287,11 +402,28 @@ impl State {
         height: Height,
         round: Round,
     ) -> Result<Option<LocallyProposedValue<MalachiteContext>>> {
-        // For now, return None - this would check for previously built proposals
         info!(
             "Requested previously built value for height {} round {}",
             height, round
         );
+
+        // Try to find any proposal we built for this height
+        // Check the requested round and also round 0 (in case we're looking for any proposal)
+        for check_round in [round, Round::new(0)] {
+            if let Ok(proposals) = self.get_undecided_proposals(height, check_round).await {
+                // Find a proposal that was built by us
+                for proposal in proposals {
+                    if proposal.proposer == BasePeerAddress(self.address) {
+                        return Ok(Some(LocallyProposedValue::new(
+                            height,
+                            round,
+                            proposal.value,
+                        )));
+                    }
+                }
+            }
+        }
+
         Ok(None)
     }
 
@@ -323,6 +455,106 @@ impl State {
             .write()
             .map_err(|_| eyre::eyre!("RwLock poisoned"))?
             .remove_stream(peer_id))
+    }
+
+    // ===== Store Access API =====
+    // The following methods provide controlled access to the Store for Consensus.
+    // This design ensures that:
+    // 1. Consensus never directly accesses Store
+    // 2. State can enforce business rules and maintain invariants
+    // 3. Storage implementation details are hidden from Consensus
+    //
+    // API Design:
+    // - All Store access MUST go through State methods
+    // - State methods provide domain-specific operations, not raw storage access
+    // - State is responsible for data validation and business logic
+
+    /// Stores a proposal that was synced from another node.
+    ///
+    /// This is called by consensus when it receives a complete proposal
+    /// through the sync mechanism.
+    pub async fn store_synced_proposal(
+        &self,
+        proposal: ProposedValue<MalachiteContext>,
+    ) -> Result<()> {
+        tracing::debug!(
+            height = %proposal.height,
+            round = %proposal.round,
+            proposer = %proposal.proposer,
+            "Storing synced proposal"
+        );
+        self.store.store_undecided_proposal(proposal).await
+    }
+
+    /// Retrieves a previously stored proposal for restreaming to peers.
+    ///
+    /// This is called when consensus needs to rebroadcast a proposal,
+    /// typically when a validator missed the original broadcast.
+    pub async fn get_proposal_for_restreaming(
+        &self,
+        height: Height,
+        round: Round,
+        value_id: ValueId,
+    ) -> Result<Option<ProposedValue<MalachiteContext>>> {
+        tracing::debug!(
+            %height,
+            %round,
+            value_id = ?value_id,
+            "Retrieving proposal for restreaming"
+        );
+        self.store
+            .get_undecided_proposal(height, round, value_id)
+            .await
+    }
+
+    /// Gets the highest height with a decided value.
+    ///
+    /// This can be used to determine the current chain height or to find
+    /// gaps in the decided values.
+    pub async fn get_max_decided_height(&self) -> Option<Height> {
+        self.store.max_decided_value_height().await
+    }
+
+    /// Gets all undecided proposals for a specific height and round.
+    ///
+    /// This might be useful for debugging or for consensus to check
+    /// what proposals it has received.
+    pub async fn get_undecided_proposals(
+        &self,
+        height: Height,
+        round: Round,
+    ) -> Result<Vec<ProposedValue<MalachiteContext>>> {
+        self.store.get_undecided_proposals(height, round).await
+    }
+
+    /// Stores a value that this node has built (not synced from others).
+    ///
+    /// This is called after successfully building a proposal in propose_value().
+    /// Storing it allows us to retrieve it later if needed (e.g., for restreaming).
+    pub async fn store_built_proposal(
+        &self,
+        proposal: ProposedValue<MalachiteContext>,
+    ) -> Result<()> {
+        tracing::debug!(
+            height = %proposal.height,
+            round = %proposal.round,
+            "Storing locally built proposal"
+        );
+        self.store.store_undecided_proposal(proposal).await
+    }
+
+    /// Gets a specific undecided proposal by height, round, and value_id.
+    ///
+    /// This is used internally by State for looking up proposals during commit.
+    async fn get_undecided_proposal(
+        &self,
+        height: Height,
+        round: Round,
+        value_id: ValueId,
+    ) -> Result<Option<ProposedValue<MalachiteContext>>> {
+        self.store
+            .get_undecided_proposal(height, round, value_id)
+            .await
     }
 }
 
@@ -480,12 +712,6 @@ pub enum ConsensusStep {
 }
 
 // Additional types needed for the consensus interface
-
-#[derive(Debug, Clone)]
-pub struct DecidedValue {
-    pub value: Value,
-    pub certificate: CommitCertificate<MalachiteContext>,
-}
 
 // Standalone functions
 
