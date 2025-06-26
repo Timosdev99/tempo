@@ -61,25 +61,25 @@ pub fn load_engine_config(
         .get("metrics")
         .and_then(|m| m.get("listen_addr"))
         .and_then(|v| v.as_str())
-        .and_then(|addr| addr.split(':').last())
+        .and_then(|addr| addr.split(':').next_back())
         .and_then(|port| port.parse::<u16>().ok())
         .unwrap_or(9000);
 
     // Extract the consensus port from listen_addr
     let consensus_port = listen_addr
         .split('/')
-        .last()
+        .next_back()
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(26656);
 
     // Create socket address
-    let socket_addr = format!("127.0.0.1:{}", consensus_port).parse()?;
+    let socket_addr = format!("127.0.0.1:{consensus_port}").parse()?;
 
     // Create node config with the loaded settings
     let mut node_config = NodeConfig::new(node_id.clone(), listen_addr.to_string(), peers.clone());
 
     // Update metrics port
-    node_config.metrics.listen_addr = format!("0.0.0.0:{}", metrics_port).parse()?;
+    node_config.metrics.listen_addr = format!("0.0.0.0:{metrics_port}").parse()?;
 
     // Create engine config
     let mut engine_config = EngineConfig::new(chain_id, node_id, socket_addr);
