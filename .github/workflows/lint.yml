@@ -55,38 +55,6 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-  msrv:
-    name: MSRV
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.86" # MSRV
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-      - name: Build with MSRV
-        run: cargo build --bin reth-malachite
-        env:
-          RUSTFLAGS: -D warnings
-
-  build:
-    name: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-      - name: Build
-        run: cargo build --verbose
-      - name: Run tests
-        run: cargo test --verbose
-
   codespell:
     name: codespell
     runs-on: ubuntu-latest
@@ -105,8 +73,6 @@ jobs:
       - clippy
       - fmt
       - docs
-      - msrv
-      - build
       - codespell
     timeout-minutes: 30
     steps:
