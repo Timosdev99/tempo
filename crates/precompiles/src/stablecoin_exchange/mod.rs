@@ -5,9 +5,7 @@ pub mod order;
 pub mod orderbook;
 
 pub use order::Order;
-pub use orderbook::{
-    MAX_TICK, MIN_TICK, Orderbook, PRICE_SCALE, TickLevel, price_to_tick, tick_to_price,
-};
+pub use orderbook::{MAX_TICK, MIN_TICK, Orderbook, PRICE_SCALE, TickLevel, tick_to_price};
 pub use tempo_contracts::precompiles::{
     IStablecoinExchange, StablecoinExchangeError, StablecoinExchangeEvents,
 };
@@ -369,6 +367,18 @@ impl<'a, S: PrecompileStorageProvider> StablecoinExchange<'a, S> {
     /// Get all book keys
     pub fn get_book_keys(&mut self) -> Result<Vec<B256>> {
         self.sload_book_keys()
+    }
+
+    /// Convert scaled price to relative tick
+    /// Post-Moderato: validates price is within [MIN_PRICE, MAX_PRICE]
+    /// Pre-Moderato: no validation (legacy behavior)
+    pub fn price_to_tick(&self, price: u32) -> Result<i16> {
+        if self.storage.spec().is_moderato() {
+            // Post-Moderato: validate price bounds
+            orderbook::price_to_tick_post_moderato(price)
+        } else {
+            orderbook::price_to_tick_pre_moderato(price)
+        }
     }
 
     pub fn create_pair(&mut self, base: Address) -> Result<B256> {
@@ -1603,11 +1613,83 @@ mod tests {
         let test_prices = [
             98000u32, 99000, 99900, 99999, 100000, 100001, 100100, 101000, 102000,
         ];
+
+        let mut storage = HashMapStorageProvider::new(1).with_spec(TempoHardfork::Adagio);
+        let exchange = StablecoinExchange::new(&mut storage);
+
         for price in test_prices {
-            let tick = orderbook::price_to_tick(price);
+            let tick = exchange.price_to_tick(price).unwrap();
             let expected_tick = (price as i32 - orderbook::PRICE_SCALE as i32) as i16;
             assert_eq!(tick, expected_tick);
         }
+    }
+
+    #[test]
+    fn test_price_to_tick_post_moderato() -> eyre::Result<()> {
+        // Post-Moderato: price validation should be enforced
+        let mut storage = HashMapStorageProvider::new(1).with_spec(TempoHardfork::Moderato);
+        let exchange = StablecoinExchange::new(&mut storage);
+
+        // Valid prices should succeed
+        assert_eq!(exchange.price_to_tick(orderbook::PRICE_SCALE)?, 0);
+        assert_eq!(
+            exchange.price_to_tick(orderbook::MIN_PRICE_POST_MODERATO)?,
+            MIN_TICK
+        );
+        assert_eq!(
+            exchange.price_to_tick(orderbook::MAX_PRICE_POST_MODERATO)?,
+            MAX_TICK
+        );
+
+        // Out of bounds prices should fail
+        let result = exchange.price_to_tick(orderbook::MIN_PRICE_POST_MODERATO - 1);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            TempoPrecompileError::StablecoinExchange(StablecoinExchangeError::TickOutOfBounds(_))
+        ));
+
+        let result = exchange.price_to_tick(orderbook::MAX_PRICE_POST_MODERATO + 1);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            TempoPrecompileError::StablecoinExchange(StablecoinExchangeError::TickOutOfBounds(_))
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_price_to_tick_pre_moderato() -> eyre::Result<()> {
+        // Pre-Moderato: no price validation (legacy behavior)
+        let mut storage = HashMapStorageProvider::new(1).with_spec(TempoHardfork::Adagio);
+        let exchange = StablecoinExchange::new(&mut storage);
+
+        // Valid prices should succeed
+        assert_eq!(exchange.price_to_tick(orderbook::PRICE_SCALE)?, 0);
+        assert_eq!(
+            exchange.price_to_tick(orderbook::MIN_PRICE_PRE_MODERATO)?,
+            i16::MIN
+        );
+        assert_eq!(
+            exchange.price_to_tick(orderbook::MAX_PRICE_PRE_MODERATO)?,
+            i16::MAX
+        );
+
+        // Out of bounds prices should also succeed (legacy behavior)
+        let tick = exchange.price_to_tick(orderbook::MIN_PRICE_PRE_MODERATO - 1)?;
+        assert_eq!(
+            tick,
+            ((orderbook::MIN_PRICE_PRE_MODERATO - 1) as i32 - orderbook::PRICE_SCALE as i32) as i16
+        );
+
+        let tick = exchange.price_to_tick(orderbook::MAX_PRICE_PRE_MODERATO + 1)?;
+        assert_eq!(
+            tick,
+            ((orderbook::MAX_PRICE_PRE_MODERATO + 1) as i32 - orderbook::PRICE_SCALE as i32) as i16
+        );
+
+        Ok(())
     }
 
     #[test]
