@@ -8,7 +8,8 @@ use reth_tracing::{
     tracing::{debug, error, info},
 };
 use tempo_alloy::{
-    TempoNetwork, dyn_signable_from_typed, primitives::TempoTxEnvelope, typed_into_signed,
+    TempoNetwork, dyn_signable_from_typed, primitives::TempoTxEnvelope,
+    provider::ext::TempoProviderBuilderExt, typed_into_signed,
 };
 
 use alloy::{
@@ -177,11 +178,9 @@ impl MaxTpsArgs {
             self.from_mnemonic_index,
             accounts,
             self.target_urls.clone(),
-            Box::new(|target_url, cached_nonce_manager| {
-                ProviderBuilder::default()
-                    .fetch_chain_id()
-                    .with_gas_estimation()
-                    .with_nonce_management(cached_nonce_manager)
+            Box::new(|target_url, _cached_nonce_manager| {
+                ProviderBuilder::new_with_network::<TempoNetwork>()
+                    .with_random_2d_nonces()
                     .connect_http(target_url)
             }),
             Box::new(|signer, target_url, cached_nonce_manager| {
@@ -202,7 +201,7 @@ impl MaxTpsArgs {
                     .raw_request("admin_clearTxpool".into(), NoParams::default())
                     .await
                     .context(
-                        "Failed to clear transaction pool for {target_url}. Is `admin_clearTxpool` RPC method available?",
+                        format!("Failed to clear transaction pool for {target_url}. Is `admin_clearTxpool` RPC method available?"),
                     )?;
                 info!(%target_url, transactions, "Cleared transaction pool");
             }
@@ -243,6 +242,17 @@ impl MaxTpsArgs {
         .await
         .context("Failed to set default fee token")?;
 
+        // Setup DEX
+        let user_tokens = 2;
+        info!(user_tokens, "Setting up DEX");
+        let (quote_token, user_tokens) = dex::setup(
+            signer_providers,
+            user_tokens,
+            self.max_concurrent_requests,
+            self.max_concurrent_transactions,
+        )
+        .await?;
+
         // Generate all transactions
         let total_txs = self.tps * self.duration;
         let tip20_weight = (self.tip20_weight * Self::WEIGHT_PRECISION).trunc() as u64;
@@ -253,10 +263,11 @@ impl MaxTpsArgs {
             accounts,
             signer_provider_manager: signer_provider_manager.clone(),
             max_concurrent_requests: self.max_concurrent_requests,
-            max_concurrent_transactions: self.max_concurrent_transactions,
             tip20_weight,
             place_order_weight,
             swap_weight,
+            quote_token,
+            user_tokens,
         })
         .await
         .context("Failed to generate transactions")?;
@@ -450,10 +461,11 @@ async fn generate_transactions<F: TxFiller<TempoNetwork> + 'static>(
         accounts,
         signer_provider_manager,
         max_concurrent_requests,
-        max_concurrent_transactions,
         tip20_weight,
         place_order_weight,
         swap_weight,
+        quote_token,
+        user_tokens,
     } = input;
 
     let txs_per_sender = total_txs / accounts;
@@ -461,14 +473,6 @@ async fn generate_transactions<F: TxFiller<TempoNetwork> + 'static>(
         txs_per_sender > 0,
         "txs per sender is 0, increase tps or decrease senders"
     );
-
-    let (quote, user_tokens) = dex::setup(
-        signer_provider_manager.signer_providers(),
-        2,
-        max_concurrent_requests,
-        max_concurrent_transactions,
-    )
-    .await?;
 
     info!(transactions = total_txs, "Generating transactions");
 
@@ -518,7 +522,7 @@ async fn generate_transactions<F: TxFiller<TempoNetwork> + 'static>(
 
                     // Swap minimum possible amount
                     exchange
-                        .quoteSwapExactAmountIn(token, quote, 1)
+                        .quoteSwapExactAmountIn(token, quote_token, 1)
                         .into_transaction_request()
                 }
                 2 => {
@@ -847,15 +851,17 @@ async fn assert_receipts<R: ReceiptResponse, F: Future<Output = eyre::Result<R>>
 ) -> eyre::Result<()> {
     stream::iter(receipts.into_iter())
         .buffer_unordered(max_concurrent_requests)
-        .try_for_each(async |receipt| {
-            eyre::ensure!(
-                receipt.status(),
-                "Transaction {} failed",
-                receipt.transaction_hash()
-            );
-            Ok(())
-        })
+        .try_for_each(|receipt| assert_receipt(receipt))
         .await
+}
+
+async fn assert_receipt<R: ReceiptResponse>(receipt: R) -> eyre::Result<()> {
+    eyre::ensure!(
+        receipt.status(),
+        "Transaction {} failed",
+        receipt.transaction_hash()
+    );
+    Ok(())
 }
 
 struct GenerateTransactionsInput<F: TxFiller<TempoNetwork>> {
@@ -863,8 +869,9 @@ struct GenerateTransactionsInput<F: TxFiller<TempoNetwork>> {
     accounts: u64,
     signer_provider_manager: SignerProviderManager<F>,
     max_concurrent_requests: usize,
-    max_concurrent_transactions: usize,
     tip20_weight: u64,
     place_order_weight: u64,
     swap_weight: u64,
+    quote_token: Address,
+    user_tokens: Vec<Address>,
 }
